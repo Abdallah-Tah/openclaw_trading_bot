@@ -429,51 +429,44 @@ def engine_report():
 
 
 
-def reconcile_report():
-    """Load corrected BTC/ETH 15m market-position reconciliation."""
-    import json as _json
-    import subprocess as _sp
+def direct_trade_stats():
+    """Load BTC/ETH/SOL trade stats directly from journal.db trades table."""
+    import sqlite3
     out = {
-        'rows': [],
-        'summary': {'market_positions': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'win_rate': 0.0, 'net_realized_pnl': 0.0},
-        'posted_stats': {'btc15m': {'posted_orders': 0, 'filled_orders': 0}, 'eth15m': {'posted_orders': 0, 'filled_orders': 0}},
+        'summary': {'resolved': 0, 'wins': 0, 'losses': 0, 'net_realized_pnl': 0.0},
         'by_engine': {
-            'btc15m': {'market_positions': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
-            'eth15m': {'market_positions': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
+            'btc15m': {'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
+            'eth15m': {'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
+            'sol15m': {'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
         }
     }
+    conn = sqlite3.connect(str(ROOT / 'journal.db'))
+    c = conn.cursor()
     try:
-        cp = _sp.run([str(ROOT / '.polymarket-venv' / 'bin' / 'python3'), str(ROOT / 'scripts' / 'polymarket_reconcile.py'), '--json', '--no-sync'], capture_output=True, text=True, timeout=10)
-        if not cp.stdout.strip():
-            return out
-        data = _json.loads(cp.stdout)
-        out['rows'] = data.get('rows', [])
-        out['summary'] = data.get('summary', out['summary'])
-        out['posted_stats'] = data.get('posted_stats', out['posted_stats'])
-        for row in out['rows']:
-            eng = row.get('engine')
-            if eng not in out['by_engine']:
+        c.execute("""
+            SELECT engine,
+                   COUNT(*) as total,
+                   COALESCE(SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END), 0) as wins,
+                   COALESCE(SUM(CASE WHEN pnl_absolute <= 0 THEN 1 ELSE 0 END), 0) as losses,
+                   COALESCE(ROUND(SUM(pnl_absolute), 2), 0) as total_pnl
+            FROM trades
+            WHERE engine IN ('btc15m', 'eth15m', 'sol15m')
+            GROUP BY engine
+        """)
+        rows = c.fetchall()
+        for engine, total, wins, losses, total_pnl in rows:
+            if engine not in out['by_engine']:
                 continue
-            bucket = out['by_engine'][eng]
-            bucket['market_positions'] += 1
-            if row.get('status') in ('RESOLVED_WON', 'RESOLVED_LOST'):
-                bucket['resolved'] += 1
-                if row.get('status') == 'RESOLVED_WON':
-                    bucket['wins'] += 1
-                else:
-                    bucket['losses'] += 1
-                bucket['net_realized_pnl'] += float(row.get('realized_pnl') or 0)
-            else:
-                bucket['pending'] += 1
-        for eng, bucket in out['by_engine'].items():
-            ps = out['posted_stats'].get(eng, {})
-            bucket['posted_orders'] = int(ps.get('posted_orders') or 0)
-            bucket['filled_orders'] = int(ps.get('filled_orders') or 0)
-            if bucket['posted_orders']:
-                bucket['true_fill_rate'] = bucket['filled_orders'] / bucket['posted_orders'] * 100.0
-    except Exception as e:
-        logger.error('Reconcile report error: %s', e)
-        return out
+            out['by_engine'][engine]['resolved'] = int(total or 0)
+            out['by_engine'][engine]['wins'] = int(wins or 0)
+            out['by_engine'][engine]['losses'] = int(losses or 0)
+            out['by_engine'][engine]['net_realized_pnl'] = float(total_pnl or 0.0)
+            out['summary']['resolved'] += int(total or 0)
+            out['summary']['wins'] += int(wins or 0)
+            out['summary']['losses'] += int(losses or 0)
+            out['summary']['net_realized_pnl'] += float(total_pnl or 0.0)
+    finally:
+        conn.close()
     return out
 
 def fmt_money(x):
@@ -485,7 +478,7 @@ def main():
     sol = sol_report()
     an = analytics_report()
     engines = engine_report()
-    recon = reconcile_report()
+    recon = direct_trade_stats()
     milestones = milestone_report(poly['current_total_capital'])
     bl_count = blacklist_count()
     redeem = redeemable_report()
