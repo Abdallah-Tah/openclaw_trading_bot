@@ -1,0 +1,7 @@
+journal.db
+journal.db-shm
+journal.db-wal
+trading/journal.db
+trading/journal.db-shm
+trading/journal.db-wal
+*.log
