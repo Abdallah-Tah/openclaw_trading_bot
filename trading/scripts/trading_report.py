@@ -369,6 +369,15 @@ def engine_report():
                 info['running'] = True
             except Exception:
                 pass
+        if not info['running']:
+            try:
+                cp = subprocess.run(['pgrep', '-f', str(spec['script'])], capture_output=True, text=True, check=False)
+                pids = [x.strip() for x in cp.stdout.splitlines() if x.strip()]
+                if pids:
+                    info['pid'] = int(pids[0])
+                    info['running'] = True
+            except Exception:
+                pass
 
         try:
             c.execute("""
