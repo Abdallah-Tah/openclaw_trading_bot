@@ -443,7 +443,9 @@ def reconcile_report():
         }
     }
     try:
-        cp = _sp.run([str(ROOT / '.polymarket-venv' / 'bin' / 'python3'), str(ROOT / 'scripts' / 'polymarket_reconcile.py'), '--json', '--no-sync'], capture_output=True, text=True, timeout=60)
+        cp = _sp.run([str(ROOT / '.polymarket-venv' / 'bin' / 'python3'), str(ROOT / 'scripts' / 'polymarket_reconcile.py'), '--json', '--no-sync'], capture_output=True, text=True, timeout=10)
+        if not cp.stdout.strip():
+            return out
         data = _json.loads(cp.stdout)
         out['rows'] = data.get('rows', [])
         out['summary'] = data.get('summary', out['summary'])
@@ -471,6 +473,7 @@ def reconcile_report():
                 bucket['true_fill_rate'] = bucket['filled_orders'] / bucket['posted_orders'] * 100.0
     except Exception as e:
         logger.error('Reconcile report error: %s', e)
+        return out
     return out
 
 def fmt_money(x):
