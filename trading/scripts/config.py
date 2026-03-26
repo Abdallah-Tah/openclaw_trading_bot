@@ -93,6 +93,10 @@ NEWS_SOURCES              = ["brave_api", "duckduckgo", "google_rss"]
 POLY_DEFAULT_SIZE         = _float("POLY_DEFAULT_SIZE",        8.00)
 POLY_HIGH_CONVICTION_SIZE = _float("POLY_HIGH_CONVICTION_SIZE",10.00)
 POLY_MAX_SIZE             = _float("POLY_MAX_SIZE",           15.00)
+
+# Safety: Daily loss limit triggers size reduction
+DAILY_LOSS_LIMIT          = _float("DAILY_LOSS_LIMIT",        50.00)  # Stop trading if daily loss exceeds this
+FALLBACK_SIZE             = _float("FALLBACK_SIZE",            5.00)  # Reduce to this size after hitting loss limit
 POLY_MIN_SHARES           = _int(  "POLY_MIN_SHARES",            5)
 POLY_MAX_POSITIONS        = _int(  "POLY_MAX_POSITIONS",          8)
 POLY_MAX_TOTAL_ORDERS     = _int(  "POLY_MAX_TOTAL_ORDERS",      10)
@@ -153,6 +157,6 @@ BTC15M_SNIPE_STRONG_DELTA = _float("BTC15M_SNIPE_STRONG_DELTA",  0.10)
 BTC15M_SNIPE_WINDOW_SEC  = _int(  "BTC15M_SNIPE_WINDOW_SEC",       15)
 BTC15M_PRICE_POLL_SEC    = _int(  "BTC15M_PRICE_POLL_SEC",         5)
 BTC15M_SCAN_INTERVAL      = _int(  "BTC15M_SCAN_INTERVAL",        10)
-BTC15M_MAX_DAILY_LOSS     = _float("BTC15M_MAX_DAILY_LOSS",      20.00)
+BTC15M_MAX_DAILY_LOSS     = _float("BTC15M_MAX_DAILY_LOSS",      50.00)  # Increased to match global DAILY_LOSS_LIMIT
 BTC15M_SERIES_ID          = "10192"
 BTC15M_SERIES_SLUG        = "btc-up-or-down-15m"
