@@ -37,4 +37,15 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 
 ---
 
+### TTS / Voice
+
+- Main English voice for Taco: the current OpenClaw/TTS English voice used in the intro sample approved on 2026-03-25
+- Arabic voice previously preferred for Taco: **Hamed**
+- Voice interaction preference: if user sends voice, reply with voice in the same language when possible
+
+### Wallets
+
+- Polymarket wallet: `0x1a4c163a134D7154ebD5f7359919F9c439424f00`
+- Solana wallet: `J6nK35ud8u6hzqDxuEtVWPsAMzv2v7H6stsxXW2rsnuH`
+
 Add whatever helps you do your job. This is your cheat sheet.

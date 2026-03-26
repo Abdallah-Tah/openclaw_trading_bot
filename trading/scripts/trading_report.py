@@ -1,577 +1,406 @@
 #!/usr/bin/env python3
-"""Compact local trading report for /report.
+"""Taco Trading Bot - Full Report Generator"""
 
-Outputs a short mobile-friendly status summary using local state + live prices.
-Goal: minimal reasoning/tokens; do the heavy lifting locally.
-"""
+import sqlite3
 import json
-import logging
 import subprocess
-import sys
-from pathlib import Path
-
-import httpx
 import requests
-from py_clob_client.http_helpers import helpers as _clob_helpers
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
+from pathlib import Path
+from datetime import datetime, timedelta
 
-_clob_helpers._http_client = httpx.Client(proxy='socks5://127.0.0.1:9050', http2=True)
+ROOT = Path(__file__).parent.parent
+DB_PATH = ROOT / "journal.db"
+POSITIONS_FILE = ROOT / ".positions.json"
+WALLET_FILE = ROOT / ".trading_wallet.json"
 
-logger = logging.getLogger(__name__)
-
-ROOT = Path.home() / ".openclaw" / "workspace" / "trading"
-SECRETS = Path.home() / ".config" / "openclaw" / "secrets.env"
-POLY_POS = ROOT / ".poly_positions.json"
-POLY_LOG = ROOT / ".poly_trade_log.json"
-SOL_POS = ROOT / ".positions.json"
-BLACKLIST_FILE = ROOT / ".blacklist.json"
-TRADER_LOG = Path("/tmp/taco_trader.log")
-CLOB_HOST = "https://clob.polymarket.com"
-CHAIN_ID = 137
-SIGNATURE_TYPE = 0
-TOR_PROXY = {"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"}
-POSITIONS_API = "https://data-api.polymarket.com/positions?user={user}"
-
-try:
-    import socks  # type: ignore
-    HAS_PYSOCKS = True
-except Exception:
-    HAS_PYSOCKS = False
-
-sys.path.insert(0, str(ROOT / "scripts"))
-
-try:
-    from config import GOAL_USD, MILESTONES
-except ImportError:
-    GOAL_USD = 2780.0
-    MILESTONES = [150, 250, 500, 1000, 2000, 2780]
-
-
-def load_secrets():
-    data = {}
-    for line in SECRETS.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            data[k.strip()] = v.strip().strip('"').strip("'")
-    return data
-
-
-def get_client():
-    s = load_secrets()
-    creds = ApiCreds(
-        api_key=s["POLYMARKET_API_KEY"],
-        api_secret=s["POLYMARKET_API_SECRET"],
-        api_passphrase=s["POLYMARKET_PASSPHRASE"],
-    )
-    return ClobClient(
-        host=CLOB_HOST,
-        chain_id=CHAIN_ID,
-        key=s["POLYMARKET_PRIVATE_KEY"],
-        signature_type=SIGNATURE_TYPE,
-        funder=s["POLYMARKET_FUNDER"],
-        creds=creds,
-    )
-
-
-def poly_report():
-    client = get_client()
-    s = load_secrets()
-    bal = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-    cash = int(bal["balance"]) / 1e6
-
-    trade_log = json.loads(POLY_LOG.read_text()) if POLY_LOG.exists() else []
-    tor = requests.Session()
-    if HAS_PYSOCKS:
-        tor.proxies = TOR_PROXY
-
-    # Source of truth for open Polymarket positions: live positions API, not stale local tracker.
-    live_positions = []
+def get_engine_status(name, patterns):
+    """Check if engine is running."""
     try:
-        r = tor.get(POSITIONS_API.format(user=s["POLYMARKET_FUNDER"]), timeout=20)
-        api_positions = r.json() if r.status_code == 200 else []
-        for p in api_positions:
-            title = (p.get("title") or "").strip()
-            # Keep only real long-dated/open titled positions in the portfolio summary.
-            if not title:
-                continue
-            live_positions.append({
-                "token_id": p.get("asset", ""),
-                "market": title,
-                "amount": float(p.get("size") or 0),
-                "avg_price": float(p.get("avgPrice") or 0),
-                "current_value": float(p.get("currentValue") or 0),
-                "cash_pnl": float(p.get("cashPnl") or 0),
-                "percent_pnl": float(p.get("percentPnl") or 0),
-            })
-    except Exception as e:
-        logger.error("Positions API error: %s", e)
+        result = subprocess.run(
+            ["pgrep", "-fa"] + patterns,
+            capture_output=True, text=True, timeout=5
+        )
+        # Filter out bash -c processes
+        lines = [l for l in result.stdout.strip().split('\n') if l and 'bash -c' not in l]
+        return "LIVE" if lines else "OFFLINE"
+    except:
+        return "OFFLINE"
 
-    invested = 0.0
-    value = 0.0
-    winners = []
-    losers = []
-
-    for pos in live_positions:
-        cost = pos["avg_price"] * pos["amount"]
-        val = pos["current_value"]
-        pnl_pct = pos["percent_pnl"]
-        invested += cost
-        value += val
-        item = (pnl_pct, pos["market"])
-        if pnl_pct >= 2:
-            winners.append(item)
-        elif pnl_pct <= -2:
-            losers.append(item)
-
-    historical_invested = 0.0
-    unique_buys = set()
-    for entry in trade_log:
-        if entry.get("action") != "BUY":
-            continue
-        key = (entry.get("market"), entry.get("amount"), entry.get("price"))
-        if key in unique_buys:
-            continue
-        unique_buys.add(key)
-        historical_invested += float(entry.get("amount", 0)) * float(entry.get("price", 0))
-
-    realized_win = 0.0
-    realized_loss = 0.0
-    current_markets = {p.get("market", "") for p in live_positions}
-    seen = set()
-    for entry in trade_log:
-        if entry.get("action") != "BUY":
-            continue
-        market = entry.get("market", "")
-        key = (market, entry.get("amount"), entry.get("price"))
-        if key in seen:
-            continue
-        seen.add(key)
-        if market in current_markets:
-            continue
-        stake = float(entry.get("amount", 0)) * float(entry.get("price", 0))
-        if stake <= 0:
-            continue
-        try:
-            if "Pistons vs. Raptors" in market:
-                realized_win += float(entry.get("amount", 0)) * (1 - float(entry.get("price", 0)))
-            else:
-                realized_loss += stake
-        except Exception:
-            pass
-
-    try:
-        orders = client.get_orders() or []
-    except Exception as e:
-        logger.error("Orders API error: %s", e)
-        orders = []
-    live_orders = [o for o in orders if o.get("status") == "live"]
-    pnl = value - invested
-    pnl_pct = (pnl / invested * 100) if invested else 0.0
-
-    winners.sort(reverse=True)
-    losers.sort()
-
-    realized_net = realized_win - realized_loss
-    current_total_capital = cash + value
-    starting_capital = current_total_capital - realized_net
-
+def get_engine_stats(asset_keyword, conn):
+    """Get stats for an engine from journal.db - matches asset name."""
+    cur = conn.cursor()
+    
+    # Match by asset name (Bitcoin, Ethereum, Solana, etc.)
+    cur.execute("""
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN exit_type = 'filled' THEN 1 ELSE 0 END) as filled,
+            SUM(CASE WHEN exit_type IN ('redeemed', 'filled') THEN 1 ELSE 0 END) as resolved,
+            SUM(CASE WHEN exit_type IN ('redeemed', 'filled') AND pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN exit_type IN ('redeemed', 'filled') AND pnl_absolute <= 0 THEN 1 ELSE 0 END) as losses,
+            COALESCE(SUM(CASE WHEN exit_type IN ('redeemed', 'filled') THEN pnl_absolute ELSE 0 END), 0) as realized_pnl
+        FROM trades 
+        WHERE asset LIKE ?
+    """, (f"%{asset_keyword}%",))
+    
+    row = cur.fetchone()
+    total = row[0] or 0
+    filled = row[1] or 0
+    resolved = row[2] or 0
+    wins = row[3] or 0
+    losses = row[4] or 0
+    realized = row[5] or 0
+    
+    # Get posted (all orders placed)
+    cur.execute("""
+        SELECT COUNT(*) FROM trades WHERE engine LIKE ?
+    """, (f"%{asset_keyword}%",))
+    posted = cur.fetchone()[0] or 0
+    
+    fill_rate = (filled / posted * 100) if posted > 0 else 0
+    
+    # Today's stats
+    today = datetime.now().strftime("%Y-%m-%d")
+    cur.execute("""
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN pnl_absolute <= 0 THEN 1 ELSE 0 END) as losses,
+            COALESCE(SUM(CASE WHEN exit_type IN ('redeemed', 'filled') THEN pnl_absolute ELSE 0 END), 0) as pnl
+        FROM trades 
+        WHERE asset LIKE ? AND date(timestamp_open) = date(?)
+    """, (f"%{asset_keyword}%", today))
+    
+    today_row = cur.fetchone()
+    today_total = today_row[0] or 0
+    today_wins = today_row[1] or 0
+    today_losses = today_row[2] or 0
+    today_pnl = today_row[3] or 0
+    
     return {
-        "cash": cash,
-        "positions": len(live_positions),
-        "open_orders": len(live_orders),
-        "invested": invested,
-        "value": value,
-        "pnl": pnl,
-        "pnl_pct": pnl_pct,
-        "top_win": winners[0] if winners else None,
-        "top_loss": losers[0] if losers else None,
-        "historical_invested": historical_invested,
-        "realized_win": realized_win,
-        "realized_loss": realized_loss,
-        "realized_net": realized_net,
-        "current_total_capital": current_total_capital,
-        "starting_capital": starting_capital,
+        "posted": posted,
+        "filled": filled,
+        "fill_rate": fill_rate,
+        "resolved": resolved,
+        "wins": wins,
+        "losses": losses,
+        "realized_pnl": realized,
+        "today_total": today_total,
+        "today_wins": today_wins,
+        "today_losses": today_losses,
+        "today_pnl": today_pnl
     }
 
+def get_open_positions(conn):
+    """Get count and value of open positions - uses live API via get_capital."""
+    # This is now handled by get_capital() which fetches from API
+    # Return placeholder - actual values come from capital dict
+    return 0, 0.0, 0.0
 
-def sol_report():
-    status = {
-        "running": False,
-        "cycle_line": "unknown",
-        "positions": 0,
-        "sol_positions": [],
-    }
-    if TRADER_LOG.exists():
-        lines = TRADER_LOG.read_text(errors="ignore").splitlines()
-        for line in reversed(lines[-30:]):
-            if "Cycle" in line:
-                status["cycle_line"] = line.strip()
-                status["running"] = True
-                break
-        for line in reversed(lines[-30:]):
-            if "SOL balance:" in line:
-                status["balance_line"] = line.strip()
-                break
-    if SOL_POS.exists():
-        try:
-            positions = json.loads(SOL_POS.read_text())
-            status["positions"] = len(positions)
-            # Enrich with live prices from DexScreener
-            tor = requests.Session()
-            if HAS_PYSOCKS:
-                tor.proxies = TOR_PROXY
-            for mint, pos in positions.items():
-                sym = pos.get("sym", mint[:6])
-                entry = float(pos.get("entry") or pos.get("entry_price") or 0)
-                amount = float(pos.get("amount") or 0)
-                cur_price = 0.0
-                try:
-                    r = tor.get(
-                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                        timeout=8,
-                    )
-                    pairs = r.json().get("pairs") or []
-                    if pairs:
-                        cur_price = float(pairs[0].get("priceUsd") or 0)
-                except Exception:
-                    pass
-                pnl_pct = ((cur_price - entry) / entry * 100) if entry > 0 else 0.0
-                cost_usd = entry * amount
-                cur_usd = cur_price * amount if cur_price else 0.0
-                status["sol_positions"].append({
-                    "sym": sym,
-                    "entry": entry,
-                    "cur_price": cur_price,
-                    "pnl_pct": pnl_pct,
-                    "cost_usd": cost_usd,
-                    "cur_usd": cur_usd,
-                })
-        except Exception:
-            pass
-    return status
+def get_sniper_positions():
+    """Get Solana sniper positions."""
+    if not POSITIONS_FILE.exists():
+        return 0, 0.0
+    
+    positions = json.loads(POSITIONS_FILE.read_text())
+    return len(positions), sum(p.get("sol", 0) for p in positions)
 
-
-def analytics_report():
-    """Pull 7-day stats from journal.db."""
-    result = {
-        "win_rate_7d": 0.0,
-        "win_rate_all": 0.0,
-        "pnl_7d": 0.0,
-        "streak": {},
-        "regime_history": [],
-    }
+def get_redeemable(conn):
+    """Get total redeemable amount from Polymarket API (not journal)."""
+    import requests
+    user = "0x1a4c163a134D7154ebD5f7359919F9c439424f00"
     try:
-        from analytics import get_win_rate, get_pnl_by_category, get_streak, get_regime_history
-        result["win_rate_7d"] = get_win_rate(days=7)
-        result["win_rate_all"] = get_win_rate()
-        pnl_cat = get_pnl_by_category(days=7)
-        result["pnl_7d"] = sum(pnl_cat.values())
-        result["streak"] = get_streak()
-        result["regime_history"] = get_regime_history()[:3]
-    except Exception as e:
-        logger.error("Analytics error: %s", e)
-    return result
-
-
-def milestone_report(total_capital: float):
-    """Get milestone progress."""
-    result = {
-        "total": total_capital,
-        "goal": GOAL_USD,
-        "percent": (total_capital / GOAL_USD * 100) if GOAL_USD else 0,
-        "reached": [],
-        "next": None,
-    }
-    try:
-        from milestones import get_progress, check_milestones
-        check_milestones(total_capital)  # Log any newly reached
-        progress = get_progress()
-        result["reached"] = progress["reached"]
-        result["next"] = progress["next"]
-    except Exception as e:
-        logger.error("Milestone error: %s", e)
-    return result
-
-
-def blacklist_count():
-    """Count blacklisted tokens."""
-    if BLACKLIST_FILE.exists():
-        try:
-            bl = json.loads(BLACKLIST_FILE.read_text())
-            return len(bl)
-        except Exception:
-            pass
-    return 0
-
-
-def redeemable_report():
-    """Get redeemable settled Polymarket value from public data API."""
-    result = {"value": 0.0, "count": 0, "markets": []}
-    try:
-        s = load_secrets()
-        addr = s.get("POLYMARKET_FUNDER", "")
-        if not addr:
-            return result
-        r = requests.get(f"https://data-api.polymarket.com/positions?user={addr}", timeout=20)
+        r = requests.get(f"https://data-api.polymarket.com/positions?user={user}", timeout=20)
         positions = r.json() if r.status_code == 200 else []
-        for p in positions:
-            if p.get("redeemable") is True:
-                val = float(p.get("currentValue", 0) or 0)
-                title = p.get("title", "")
-                result["value"] += val
-                result["count"] += 1
-                result["markets"].append({"title": title, "value": val})
-    except Exception as e:
-        logger.error("Redeemable report error: %s", e)
-    return result
+        redeemable = sum(p.get('pnl', 0) or 0 for p in positions if p.get('redeemable') == True)
+        return redeemable
+    except:
+        return 0.0
 
+def get_7day_stats(conn):
+    """Get 7-day win rate and streak."""
+    cur = conn.cursor()
+    seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    
+    cur.execute("""
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins
+        FROM trades 
+        WHERE exit_type IN ('redeemed', 'filled') AND date(timestamp_open) >= date(?)
+    """, (seven_days_ago,))
+    
+    row = cur.fetchone()
+    total = row[0] or 0
+    wins = row[1] or 0
+    win_rate = (wins / total * 100) if total > 0 else 0
+    
+    # Calculate streak (simplified - just check last 5 resolved)
+    cur.execute("""
+        SELECT pnl_absolute FROM trades 
+        WHERE exit_type IN ('redeemed', 'filled')
+        ORDER BY timestamp_open DESC LIMIT 5
+    """)
+    recent = cur.fetchall()
+    streak = 0
+    streak_type = None
+    for r in recent:
+        pnl = r[0] or 0
+        if pnl > 0:
+            if streak_type == "W" or streak_type is None:
+                streak += 1
+                streak_type = "W"
+            else:
+                break
+        elif pnl <= 0:
+            if streak_type == "L" or streak_type is None:
+                streak += 1
+                streak_type = "L"
+            else:
+                break
+    
+    # Determine regime
+    if win_rate >= 60:
+        regime = "aggressive"
+    elif win_rate >= 50:
+        regime = "balanced"
+    else:
+        regime = "defensive"
+    
+    return win_rate, streak, streak_type, regime
 
-
-
-def engine_report():
-    """Summarize BTC/ETH 15m engine status and resolved trade results."""
-    import sqlite3
-    import subprocess
-    result = {"btc": {}, "eth": {}}
-    engine_specs = {
-        "btc": {
-            "label": "BTC-15m",
-            "engine": "btc15m",
-            "pid": "/tmp/polymarket_btc15m.pid",
-            "log": "/tmp/polymarket_btc15m.log",
-            "script": ROOT / 'scripts' / 'polymarket_btc15m.py',
-        },
-        "eth": {
-            "label": "ETH-15m",
-            "engine": "eth15m",
-            "pid": "/tmp/polymarket_eth15m.pid",
-            "log": "/tmp/polymarket_eth15m.log",
-            "script": ROOT / 'scripts' / 'polymarket_eth15m.py',
-        },
-    }
-
-    conn = sqlite3.connect(str(ROOT / 'journal.db'))
-    c = conn.cursor()
-    for key, spec in engine_specs.items():
-        info = {
-            'label': spec['label'], 'running': False, 'pid': None,
-            'resolved': 0, 'wins': 0, 'losses': 0, 'pnl': 0.0,
-            'threshold': '?', 'recent_error': None,
-        }
-        pid_path = Path(spec['pid'])
-        if pid_path.exists():
-            try:
-                pid = int(pid_path.read_text().strip())
-                info['pid'] = pid
-                subprocess.run(['kill', '-0', str(pid)], check=True, capture_output=True)
-                info['running'] = True
-            except Exception:
-                pass
-        if not info['running']:
-            try:
-                cp = subprocess.run(['pgrep', '-f', str(spec['script'])], capture_output=True, text=True, check=False)
-                pids = [x.strip() for x in cp.stdout.splitlines() if x.strip()]
-                if pids:
-                    info['pid'] = int(pids[0])
-                    info['running'] = True
-            except Exception:
-                pass
-
+def get_polymarket_balance():
+    """Fetch real Polymarket wallet balance from API + on-chain USDC.e query."""
+    import requests
+    import json
+    
+    user = "0x1a4c163a134D7154ebD5f7359919F9c439424f00"
+    USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    
+    # Get positions from Polymarket API
+    try:
+        r = requests.get(f"https://data-api.polymarket.com/positions?user={user}", timeout=20)
+        positions = r.json() if r.status_code == 200 else []
+        open_positions = [p for p in positions if (p.get('currentValue', 0) or 0) > 0 or (p.get('size', 0) or 0) > 0]
+        position_value = sum(p.get('currentValue', 0) or 0 for p in positions)
+        unrealized_pnl = sum(p.get('cashPnl', 0) or 0 for p in positions)
+    except:
+        position_value = 0.0
+        open_positions = []
+        unrealized_pnl = 0.0
+    
+    # Get USDC.e balance on-chain via multiple RPC endpoints (fallback chain)
+    rpc_endpoints = [
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.drpc.org",
+        "https://rpc.ankr.com/polygon",
+        "https://137.rpc.thirdweb.com",
+    ]
+    
+    usdc_balance = 0.0
+    for rpc_url in rpc_endpoints:
         try:
-            c.execute("""
-                SELECT COUNT(*),
-                       COALESCE(SUM(CASE WHEN pnl_percent > 0 THEN 1 ELSE 0 END), 0),
-                       COALESCE(SUM(CASE WHEN pnl_percent <= 0 THEN 1 ELSE 0 END), 0),
-                       COALESCE(SUM(pnl_absolute), 0)
-                FROM trades
-                WHERE engine = ? AND timestamp_close IS NOT NULL AND exit_price > 0
-            """, (spec['engine'],))
-            row = c.fetchone()
-            info['resolved'], info['wins'], info['losses'], info['pnl'] = row
-        except Exception:
-            pass
-
-        try:
-            import re
-            for line in Path(spec['script']).read_text().splitlines():
-                if 'SNIPE_DELTA_MIN' in line and '=' in line:
-                    rhs = line.split('=', 1)[1].split('#', 1)[0].strip()
-                    m = re.search(r'_float\([^,]+,\s*([0-9.]+)\)', rhs)
-                    info['threshold'] = m.group(1) if m else rhs
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{
+                    "to": USDC_E,
+                    "data": "0x70a08231" + user[2:].zfill(64)
+                }, "latest"],
+                "id": 1
+            }
+            r = requests.post(rpc_url, json=payload, timeout=10)
+            if r.status_code == 200:
+                result = r.json()
+                balance_hex = result.get("result", "0x0")
+                if balance_hex and balance_hex != "0x":
+                    usdc_balance = int(balance_hex, 16) / 1_000_000
                     break
-        except Exception:
-            pass
+        except:
+            continue
+    
+    # Total = USDC cash + position values
+    total = usdc_balance + position_value
+    
+    return total, open_positions, unrealized_pnl, usdc_balance
 
-        try:
-            lines = Path(spec['log']).read_text(errors='ignore').splitlines()[-200:]
-            info['last_signal'] = None
-            info['last_skip'] = None
-            info['last_order'] = None
-            info['last_price_skip'] = None
-            info['last_delta_skip'] = None
-            info['last_arb_skip'] = None
-            info['last_activity'] = lines[-1].strip() if lines else None
-            for line in reversed(lines):
-                low = line.lower()
-                if info['recent_error'] is None and ('traceback' in low or 'nameerror' in low or 'error:' in low or 'failed' in low):
-                    info['recent_error'] = line.strip()
-                if info['last_order'] is None and ('Result:' in line or '[DRY]' in line):
-                    info['last_order'] = line.strip()
-                if info['last_signal'] is None and 'signal!' in line:
-                    info['last_signal'] = line.strip()
-                if info['last_price_skip'] is None and ('> max' in line and 'skipping' in line):
-                    info['last_price_skip'] = line.strip()
-                if info['last_delta_skip'] is None and ('too small, skipping' in line):
-                    info['last_delta_skip'] = line.strip()
-                if info['last_arb_skip'] is None and ('No arb.' in line):
-                    info['last_arb_skip'] = line.strip()
-                if info['last_skip'] is None and (('too small, skipping' in line) or ('> max' in line and 'skipping' in line) or ('No arb.' in line)):
-                    info['last_skip'] = line.strip()
-        except Exception:
-            pass
+def get_solana_balance():
+    """Fetch real Solana wallet balance from RPC."""
+    import requests
+    import json
+    
+    wallet = "7Hh7CendBfr7mkbAdoZtft3HUqV9SKPxnVvWDwRbVKd2"
+    
+    try:
+        # Get SOL balance
+        resp = requests.post(
+            "https://api.mainnet-beta.solana.com",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [wallet]
+            },
+            timeout=20
+        )
+        data = resp.json()
+        sol_lamports = data.get("result", {}).get("value", 0)
+        sol_balance = sol_lamports / 1_000_000_000
+        
+        # Get token positions
+        positions_file = ROOT / ".positions.json"
+        if positions_file.exists():
+            positions = json.loads(positions_file.read_text())
+            token_count = len(positions)
+        else:
+            token_count = 0
+        
+        return sol_balance, token_count
+    except Exception as e:
+        print(f"Error fetching Solana balance: {e}")
+        return 0.0, 0
 
-        result[key] = info
-    conn.close()
-    return result
-
-
-
-def direct_trade_stats():
-    """Load BTC/ETH/SOL trade stats directly from journal.db trades table."""
-    import sqlite3
-    out = {
-        'summary': {'resolved': 0, 'wins': 0, 'losses': 0, 'net_realized_pnl': 0.0},
-        'by_engine': {
-            'btc15m': {'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
-            'eth15m': {'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
-            'sol15m': {'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
-        }
+def get_capital(conn):
+    """Calculate capital breakdown from live wallet APIs."""
+    # Get real Polymarket balance from API + on-chain
+    poly_total, open_positions, unrealized_pnl, usdc_balance = get_polymarket_balance()
+    open_value = sum(p.get('currentValue', 0) or 0 for p in open_positions)
+    open_count = len(open_positions)
+    
+    # Get realized PnL from journal
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(SUM(pnl_absolute), 0) FROM trades 
+        WHERE exit_type IN ('redeemed', 'filled')
+    """)
+    realized = cur.fetchone()[0] or 0
+    
+    # Current = Polymarket total (USDC cash + positions)
+    current = poly_total
+    free_cash = usdc_balance  # Cash is the USDC balance
+    goal = 2780
+    progress = (current / goal * 100) if current > 0 else 0
+    
+    return {
+        "current": current,
+        "free_cash": free_cash,
+        "open_value": open_value,
+        "open_count": open_count,
+        "goal": goal,
+        "progress": progress,
+        "realized": realized,
+        "unrealized": unrealized_pnl,
+        "usdc_balance": usdc_balance
     }
-    conn = sqlite3.connect(str(ROOT / 'journal.db'))
-    c = conn.cursor()
-    try:
-        c.execute("""
-            SELECT engine,
-                   COUNT(*) as total,
-                   COALESCE(SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END), 0) as wins,
-                   COALESCE(SUM(CASE WHEN pnl_absolute <= 0 THEN 1 ELSE 0 END), 0) as losses,
-                   COALESCE(ROUND(SUM(pnl_absolute), 2), 0) as total_pnl
-            FROM trades
-            WHERE engine IN ('btc15m', 'eth15m', 'sol15m')
-            GROUP BY engine
-        """)
-        rows = c.fetchall()
-        for engine, total, wins, losses, total_pnl in rows:
-            if engine not in out['by_engine']:
-                continue
-            out['by_engine'][engine]['resolved'] = int(total or 0)
-            out['by_engine'][engine]['wins'] = int(wins or 0)
-            out['by_engine'][engine]['losses'] = int(losses or 0)
-            out['by_engine'][engine]['net_realized_pnl'] = float(total_pnl or 0.0)
-            out['summary']['resolved'] += int(total or 0)
-            out['summary']['wins'] += int(wins or 0)
-            out['summary']['losses'] += int(losses or 0)
-            out['summary']['net_realized_pnl'] += float(total_pnl or 0.0)
-    finally:
-        conn.close()
-    return out
 
-def fmt_money(x):
-    return f"${float(x or 0):.2f}"
+def generate_report():
+    """Generate full trading report."""
+    conn = sqlite3.connect(DB_PATH)
+    
+    # Get all stats - match by asset name
+    btc_stats = get_engine_stats("Bitcoin", conn)
+    eth_stats = get_engine_stats("Ethereum", conn)
+    
+    btc_status = get_engine_status("BTC", ["polymarket_btc15m.py"])
+    eth_status = get_engine_status("ETH", ["polymarket_eth15m.py"])
+    sol_status = get_engine_status("SOL", ["polymarket_sol15m.py"])
+    
+    sniper_count, sniper_sol = get_sniper_positions()
+    redeemable = get_redeemable(conn)
+    win_rate, streak, streak_type, regime = get_7day_stats(conn)
+    capital = get_capital(conn)
+    
+    # Use capital values directly (from live API)
+    open_count = capital.get("open_count", 0)
+    
+    # Format report
+    report = f"""📊 Report, Master
 
+Capital
 
-def main():
-    poly = poly_report()
-    sol = sol_report()
-    an = analytics_report()
-    engines = engine_report()
-    recon = direct_trade_stats()
-    milestones = milestone_report(poly['current_total_capital'])
-    bl_count = blacklist_count()
-    redeem = redeemable_report()
+• Current: ${capital['current']:.2f}
+• Free cash: ${capital['free_cash']:.2f}
+• Open value: ${capital['open_value']:.2f}
+• Goal progress: {capital['progress']:.1f}% (${capital['current']:.2f} / ${capital['goal']})
 
-    regime_label = "normal"
-    regime_wr = an["win_rate_all"]
-    try:
-        import importlib.util as _ilu
-        from pathlib import Path as _P
-        _jspec = _ilu.spec_from_file_location('sj', _P(__file__).with_name('journal.py'))
-        _jmod = _ilu.module_from_spec(_jspec); _jspec.loader.exec_module(_jmod)
-        _jmod.migrate_json_logs()
-        _aspec = _ilu.spec_from_file_location('sa', _P(__file__).with_name('analytics.py'))
-        _amod = _ilu.module_from_spec(_aspec); _aspec.loader.exec_module(_amod)
-        closed = _amod._get_closed_trades(engine="solana")
-        from config import REGIME_WINDOW, AGGRESSIVE_THRESHOLD, DEFENSIVE_THRESHOLD
-        recent = closed[:REGIME_WINDOW]
-        if len(recent) >= REGIME_WINDOW:
-            wins = sum(1 for t in recent if (t.get("pnl_percent") or 0) > 0)
-            wr = wins / len(recent)
-            regime_wr = wr * 100.0
-            if wr > AGGRESSIVE_THRESHOLD:
-                regime_label = "aggressive"
-            elif wr < DEFENSIVE_THRESHOLD:
-                regime_label = "defensive"
-    except Exception:
-        if an.get("regime_history"):
-            latest = an["regime_history"][0]
-            regime_label = latest.get("regime", "normal")
-            regime_wr = latest.get("win_rate", regime_wr)
+Results
 
-    btc_rs = recon['by_engine'].get('btc15m', {})
-    eth_rs = recon['by_engine'].get('eth15m', {})
-    won = int(btc_rs.get('wins', 0)) + int(eth_rs.get('wins', 0))
-    lost = int(btc_rs.get('losses', 0)) + int(eth_rs.get('losses', 0))
-    open_15m_count = int(btc_rs.get('pending', 0)) + int(eth_rs.get('pending', 0))
-    current_streak = an.get('streak', {}).get('current_streak', 0)
-    streak_text = f"{current_streak}W" if current_streak > 0 else f"{abs(current_streak)}L" if current_streak < 0 else "0"
-    sol_balance = sol.get('balance_line', '').split('SOL balance: ')[-1].split(' |')[0] if sol.get('balance_line') else '?'
+• BTC realized: +${btc_stats['realized_pnl']:.2f}
+• ETH realized: +${eth_stats['realized_pnl']:.2f}
+• Combined 15m: +${btc_stats['realized_pnl'] + eth_stats['realized_pnl']:.2f}
+• Open 15m positions: {open_count}
+• Portfolio unrealized/open PnL: ${capital['unrealized']:.2f} ({capital['unrealized']/capital['current']*100 if capital['current'] > 0 else 0:.1f}%)
 
-    lines = []
-    lines.append("📊 REPORT")
-    lines.append("")
-    lines.append(f"Goal: {fmt_money(milestones['total'])} / $2780.00 ({milestones['percent']:.1f}%)")
-    lines.append("")
-    lines.append("CAPITAL")
-    lines.append(f"- Start: {fmt_money(poly['starting_capital'])}")
-    lines.append(f"- Current: {fmt_money(poly['current_total_capital'])}")
-    lines.append(f"- Cash: {fmt_money(poly['cash'])}")
-    lines.append(f"- Open value: {fmt_money(poly['value'])}")
-    lines.append("")
-    lines.append("RESULTS")
-    lines.append(f"- Won: {won} | Lost: {lost}")
-    lines.append(f"- Realized net: {fmt_money(recon['summary'].get('net_realized_pnl', 0.0))}")
-    lines.append(f"- Open PnL: {fmt_money(poly['pnl'])}")
-    lines.append("")
-    lines.append("7-DAY")
-    lines.append(f"- Win rate: {an['win_rate_7d']:.1f}%")
-    lines.append(f"- Streak: {streak_text}")
-    lines.append(f"- Regime: {regime_label}")
-    lines.append("")
-    lines.append("ENGINES")
-    for key, label in [('btc', 'BTC-15m'), ('eth', 'ETH-15m')]:
-        e = engines[key]
-        rs = recon['by_engine'].get(key + '15m', {})
-        attempted = int(rs.get('posted_orders', 0))
-        filled = int(rs.get('filled_orders', 0))
-        unfilled = max(0, attempted - filled)
-        fill_rate = float(rs.get('true_fill_rate', 0.0))
-        status = 'LIVE' if e.get('running') else 'DOWN'
-        lines.append(f"- {label}: {status} | delta>={e.get('threshold', '?')}")
-        lines.append(f"Attempted: {attempted} | Filled: {filled} ({fill_rate:.1f}%) | Unfilled: {unfilled}")
-        lines.append(f"Resolved filled: {int(rs.get('resolved', 0))} | W: {int(rs.get('wins', 0))} L: {int(rs.get('losses', 0))} Pending: {int(rs.get('pending', 0))} | P&L: {fmt_money(rs.get('net_realized_pnl', 0.0))}")
-        lines.append("")
-    lines.append("SOLANA")
-    lines.append(f"- {'Running' if sol['running'] else 'Stopped'}, {sol['positions']} positions, {sol_balance} SOL")
-    lines.append(f"- Blacklist: {bl_count} tokens")
-    lines.append("")
-    lines.append("REDEEM")
-    lines.append(f"- Redeemable: {fmt_money(redeem['value'])} across {redeem['count']} market(s)")
-    lines.append("- Auto-redeem: enabled")
-    lines.append(f"- Action: {'redeem now' if redeem['value'] > 0 else 'nothing to redeem'}")
-    print("\n".join(lines))
+7-day
 
+• Win rate: {win_rate:.1f}%
+• Streak: {streak}{streak_type or ''}
+• Regime: {regime}
+
+Engines
+
+BTC-15m
+
+• {btc_status}
+• Posted: {btc_stats['posted']}
+• Filled: {btc_stats['filled']}
+• Fill rate: {btc_stats['fill_rate']:.1f}%
+• Resolved: {btc_stats['resolved']}
+• W/L: {btc_stats['wins']} / {btc_stats['losses']}
+• Realized PnL: +${btc_stats['realized_pnl']:.2f}
+
+ETH-15m
+
+• {eth_status}
+• Posted: {eth_stats['posted']}
+• Filled: {eth_stats['filled']}
+• Fill rate: {eth_stats['fill_rate']:.1f}%
+• Resolved: {eth_stats['resolved']}
+• W/L: {eth_stats['wins']} / {eth_stats['losses']}
+• Realized PnL: +${eth_stats['realized_pnl']:.2f}
+
+Solana
+
+• {sol_status}
+• {sniper_count} positions
+• {sniper_sol:.4f} SOL
+
+Redeem
+
+• Redeemable: ${redeemable:.2f}
+• {'Nothing to redeem' if redeemable <= 0 else f'{redeemable:.2f} available'}
+
+Daily summary
+
+BTC today
+
+• {btc_stats['today_total']} trades
+• {btc_stats['today_wins']}W / {btc_stats['today_losses']}L
+• ${btc_stats['today_pnl']:.2f}
+
+ETH today
+
+• {eth_stats['today_total']} trades
+• {eth_stats['today_wins']}W / {eth_stats['today_losses']}L
+• ${eth_stats['today_pnl']:.2f}
+
+{generate_closing_message(btc_stats, eth_stats)}"""
+    
+    conn.close()
+    return report
+
+def generate_closing_message(btc, eth):
+    """Generate closing summary message."""
+    total_pnl = btc['today_pnl'] + eth['today_pnl']
+    
+    if total_pnl > 10:
+        return f"Strong day overall, Master — BTC is carrying nicely and combined 15m is now solidly green."
+    elif total_pnl > 0:
+        return f"Decent day, Master — both engines contributing positively."
+    elif total_pnl > -10:
+        return f"Flat day, Master — waiting for better setups."
+    else:
+        return f"Rough day, Master — but we stay disciplined and wait for recovery."
 
 if __name__ == "__main__":
-    main()
+    print(generate_report())

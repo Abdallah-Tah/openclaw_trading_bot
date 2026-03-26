@@ -115,18 +115,20 @@ def log(msg):
         f.write(line + "\n")
 
 def tg(msg):
-    # In DRY RUN mode, all Telegram alerts are silenced — log only
     if DRY_RUN:
         return
     def _send():
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg},
-                timeout=10,
-            )
-        except Exception:
-            pass
+            cp = subprocess.run([
+                'openclaw', 'message', 'send',
+                '--channel', 'telegram',
+                '--target', str(CHAT_ID),
+                '--message', str(msg),
+            ], capture_output=True, text=True, timeout=15)
+            if cp.returncode != 0:
+                log(f"[TG-ERR] rc={cp.returncode} stderr={cp.stderr.strip()[:300]}")
+        except Exception as e:
+            log(f"[TG-ERR] {e}")
     threading.Thread(target=_send, daemon=True).start()
 
 
