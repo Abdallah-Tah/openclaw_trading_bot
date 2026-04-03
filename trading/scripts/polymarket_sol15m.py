@@ -312,6 +312,7 @@ def _resolve_dry_positions(market):
             pnl = payout - pos.get("size_usd", 0)
             outcome = "WIN" if win else "LOSS"
             log(f"[SOL-DRY-RESOLVE] {outcome} dir={pos.get('direction')} slug={pos.get('slug')} pnl=${pnl:.2f}")
+            tg(f"[SOL-15M] {'WIN' if win else 'LOST'}: {pos.get('direction', '?')} {pos.get('slug', '')} | P&L ${pnl:+.2f}")
             log_trade(
                 "sol15m",
                 pos.get("direction", "UP"),
